@@ -49,7 +49,7 @@ class SpikingMonitor:
                 print(f"  Membrane Potential: {self.membrane_potentials[name][-1]:.4f}")
                 print(f"  Threshold Crossings: {self.thresh_crossings[name][-1]:.4f}")
 
-def train(use_spike=False, atk='none', epochs=50, batch_size=32, lr=0.0001, model_type='standard', T=8):
+def train(use_spike=False, atk='none', epochs=50, batch_size=32, lr=0.0001, model_type='standard', T=8, model_size=34):
     """
     Train the model and return detailed metrics
     
@@ -61,6 +61,7 @@ def train(use_spike=False, atk='none', epochs=50, batch_size=32, lr=0.0001, mode
         lr (float): Learning rate
         model_type (str): Type of model to use ('standard', 'stateless_resnet')
         T (int): Number of time steps for spiking neurons
+        model_size (int): Size of ResNet model (18 or 34)
     
     Returns:
         dict: Dictionary containing training metrics
@@ -82,15 +83,21 @@ def train(use_spike=False, atk='none', epochs=50, batch_size=32, lr=0.0001, mode
     train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, drop_last=True)
 
-    # Initialize model
-    model = get_model(num_classes=10, use_spike=use_spike, T=T, model_type=model_type)
+    # Initialize model - ensure all models use ResNet34 architecture
+    model = get_model(
+        num_classes=10, 
+        use_spike=use_spike, 
+        T=T, 
+        model_type=model_type,
+        model_size=model_size  # Explicitly set model size to 34
+    )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     
     if model_type == 'stateless_resnet':
-        print(f"Training StatelessResNet model with T={T} on {device}")
+        print(f"Training StatelessResNet{model_size} model with T={T} on {device}")
     else:
-        print(f"Training {'spiking' if use_spike else 'non-spiking'} ResNet34 model on {device}")
+        print(f"Training {'spiking' if use_spike else 'non-spiking'} ResNet{model_size} model on {device}")
 
     # Define loss and optimizer
     criterion = nn.CrossEntropyLoss()
@@ -255,7 +262,7 @@ def train(use_spike=False, atk='none', epochs=50, batch_size=32, lr=0.0001, mode
               f"Train Acc: {train_acc:.2f}%, Test Acc: {test_acc:.2f}%")
 
     # Save the model
-    model_name = f"{'stateless_resnet' if model_type == 'stateless_resnet' else 'resnet34'}_spike_{use_spike}_atk_{atk}.pth"
+    model_name = f"{'stateless_resnet' if model_type == 'stateless_resnet' else 'resnet'}{model_size}_spike_{use_spike}_atk_{atk}.pth"
     torch.save(model.state_dict(), f"./weight/{model_name}")
 
     return {
@@ -272,7 +279,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train SNN models on MNIST.')
     parser.add_argument('--use_spike', action='store_true', help='Use spiking neurons (for standard ResNet)')
     parser.add_argument('--model_type', type=str, default='standard', choices=['standard', 'stateless_resnet'],
-                       help='Type of model to use (standard ResNet34 or StatelessResNet)')
+                       help='Type of model to use (standard ResNet or StatelessResNet)')
+    parser.add_argument('--model_size', type=int, default=34, choices=[18, 34],
+                       help='Size of ResNet model (18 or 34)')
     parser.add_argument('--attack', type=str, default='none', choices=['none', 'gn', 'pgd'],
                        help='Attack type (none, Gaussian noise, or PGD)')
     parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
@@ -289,7 +298,8 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         lr=args.lr,
         model_type=args.model_type,
-        T=args.time_steps
+        T=args.time_steps,
+        model_size=args.model_size
     )
     
     print(f"Training completed. Final test accuracy: {results['test_accuracies'][-1]:.2f}%")

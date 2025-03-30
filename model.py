@@ -201,30 +201,35 @@ class StatelessResNetBlock(nn.Module):
         return out, mem1, mem2
 
 class StatelessResNet(nn.Module):
+    """
+    Stateless version of ResNet designed for spiking neural networks.
+    This model uses StatelessResNetBlock layers instead of standard BasicBlock layers.
+    
+    The architecture follows ResNet18/34 but with adjustments for spiking neurons:
+    - ResNet18: [2,2,2,2] blocks in each layer
+    - ResNet34: [3,4,6,3] blocks in each layer
+    """
     def __init__(self, num_blocks=[2, 2, 2, 2], num_classes=10, T=4):
         super(StatelessResNet, self).__init__()
         self.T = T
-        self.in_channels = 64
         
-        # Normalization for MNIST
+        self.in_channels = 64
         self.norm = TensorNormalization((0.1307,), (0.3081,))
         
-        # Initial convolution
         self.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         
-        # Spiking parameters
-        self.thresh = 1.0
-        self.tau = 0.5
-        
-        # ResNet layers
         self.layer1 = self._make_layer(64, num_blocks[0], stride=1)
         self.layer2 = self._make_layer(128, num_blocks[1], stride=2)
         self.layer3 = self._make_layer(256, num_blocks[2], stride=2)
         self.layer4 = self._make_layer(512, num_blocks[3], stride=2)
         
-        # Final classifier
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512, num_classes)
+        
+        # Spiking parameters    
+        self.thresh = 1.0
+        self.tau = 0.5
     
     def _make_layer(self, out_channels, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
@@ -300,18 +305,32 @@ class StatelessResNet(nn.Module):
         pass
 
 def get_stateless_resnet18(num_classes=10, T=4):
-    """Returns a stateless ResNet-18 model designed for spiking neurons."""
-    return StatelessResNet([2, 2, 2, 2], num_classes, T)
+    """
+    Returns a stateless ResNet-18 model designed for spiking neurons.
+    Uses [2,2,2,2] blocks configuration.
+    """
+    model = StatelessResNet([2, 2, 2, 2], num_classes, T)
+    model.model_name = "StatelessResNet18"
+    return model
 
 def get_stateless_resnet34(num_classes=10, T=4):
-    """Returns a stateless ResNet-34 model designed for spiking neurons."""
-    return StatelessResNet([3, 4, 6, 3], num_classes, T)
+    """
+    Returns a stateless ResNet-34 model designed for spiking neurons.
+    Uses [3,4,6,3] blocks configuration (same as standard ResNet34).
+    """
+    model = StatelessResNet([3, 4, 6, 3], num_classes, T)
+    model.model_name = "StatelessResNet34"
+    return model
+
+def get_resnet18(num_classes=10):
+    """Returns a standard ResNet-18 model."""
+    return ResNet(num_blocks=[2, 2, 2, 2], num_classes=num_classes)
 
 def get_resnet34(num_classes=10):
     """Returns a standard ResNet-34 model."""
     return ResNet(num_blocks=[3, 4, 6, 3], num_classes=num_classes)
 
-def get_model(num_classes=10, dropout_rate=0.2, use_spike=False, T=8, model_type='standard'):
+def get_model(num_classes=10, dropout_rate=0.2, use_spike=False, T=8, model_type='standard', model_size=34):
     """Returns the appropriate model based on parameters
     
     Args:
@@ -320,13 +339,22 @@ def get_model(num_classes=10, dropout_rate=0.2, use_spike=False, T=8, model_type
         use_spike: Whether to use spiking neurons
         T: Number of time steps for spiking neurons
         model_type: Type of model to use ('standard', 'stateless_resnet')
+        model_size: Size of the ResNet model (18 or 34)
         
     Returns:
         A neural network model
     """
     if model_type == 'stateless_resnet':
-        print(f"Using StatelessResNet34 model with T={T}")
-        return get_stateless_resnet18(num_classes=num_classes, T=T)
+        if model_size == 18:
+            print(f"Using StatelessResNet18 model with T={T}")
+            return get_stateless_resnet18(num_classes=num_classes, T=T)
+        else:
+            print(f"Using StatelessResNet34 model with T={T}")
+            return get_stateless_resnet34(num_classes=num_classes, T=T)
     else:
-        print(f"Using standard ResNet34 model")
-        return get_resnet34(num_classes=num_classes)
+        if model_size == 18:
+            print(f"Using standard ResNet18 model")
+            return get_resnet18(num_classes=num_classes)
+        else:
+            print(f"Using standard ResNet34 model")
+            return get_resnet34(num_classes=num_classes)
