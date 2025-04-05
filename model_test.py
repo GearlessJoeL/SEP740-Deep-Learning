@@ -2,19 +2,19 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
-from model import get_model, get_stateless_resnet34, get_resnet34, get_stateless_resnet18, get_resnet18
 import os
 import numpy as np
 from sklearn.metrics import confusion_matrix
-
-# Import attack functions - explicitly reimport to ensure we get the latest version
 import importlib
-import atk
-importlib.reload(atk)
-from atk import add_gaussian_noise, pgd_attack, ATTACK_CONFIGS
+import sys
 
-# Version with backward compatibility for use_spike parameter (2023-06-30)
-# This version supports both model_type and the deprecated use_spike parameters
+# Reimport modules
+from model import get_model
+from layers import LIFSpike  # Update to correct class name
+import atk
+from atk import add_gaussian_noise, pgd_attack, ATTACK_CONFIGS, generate_adversarial_examples
+
+# Version updated to work with the new WideResNet model (2024-06-01)
 
 def evaluate_batch(model, images, labels, criterion, device):
     outputs = model(images)
@@ -38,250 +38,320 @@ def evaluate_batch(model, images, labels, criterion, device):
     
     return loss.item(), correct, per_class_correct, per_class_total, predicted
 
-def determine_model_architecture(model_path):
+def test(model, attack_type='none', batch_size=256, device='cuda', eps=0.1, proportion=0.1, optimizer='adamw'):
     """
-    Analyze a model file to determine if it's ResNet18 or ResNet34
-    
-    Args:
-        model_path (str): Path to the model file
-        
-    Returns:
-        str: 'resnet18' or 'resnet34'
+    Test the model with specified attack type
     """
-    state_dict = torch.load(model_path, map_location='cpu')
+    model.eval()
+    correct = 0
+    total = 0
+    class_correct = [0] * 10  # For MNIST, 10 classes
+    class_total = [0] * 10
     
-    # Count how many blocks in each layer
-    layer_counts = {}
-    for key in state_dict.keys():
-        if key.startswith("layer"):
-            parts = key.split(".")
-            if len(parts) > 1:
-                layer_name = parts[0]  # e.g., "layer1"
-                block_num = int(parts[1])  # e.g., 0, 1, 2...
-                
-                if layer_name not in layer_counts or block_num > layer_counts[layer_name]:
-                    layer_counts[layer_name] = block_num
+    # Initialize confusion matrix
+    conf_matrix = torch.zeros(10, 10, device=device)
     
-    # Add 1 to get the number of blocks (since they're 0-indexed)
-    for layer_name in layer_counts:
-        layer_counts[layer_name] += 1
+    # Load test data with larger batch size
+    test_dataset = datasets.MNIST('./data', train=False, download=True,
+                                 transform=transforms.Compose([
+                                     transforms.ToTensor(),
+                                     transforms.Normalize((0.1307,), (0.3081,))
+                                 ]))
     
-    # Extract the actual structure
-    actual_structure = [
-        layer_counts.get(f"layer{i+1}", 0) for i in range(4)
-    ]
+    dataset_size = len(test_dataset)
+    subset_size = int(dataset_size * proportion)
+    indices = torch.randperm(dataset_size)[:subset_size]
+    test_subset = Subset(test_dataset, indices)
     
-    # ResNet18: [2, 2, 2, 2], ResNet34: [3, 4, 6, 3]
-    if actual_structure == [2, 2, 2, 2]:
-        return 'resnet18'
-    elif actual_structure == [3, 4, 6, 3]:
-        return 'resnet34'
-    else:
-        # Default to ResNet18 for unknown structures
-        print(f"Warning: Unknown model structure {actual_structure}, defaulting to ResNet18")
-        return 'resnet18'
-
-def test(model_path, model_type='standard', use_spike=False, batch_size=64, allow_non_strict=False, model_size=34):
-    """
-    Test the model with different attack intensities
+    test_loader = torch.utils.data.DataLoader(
+        test_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
     
-    Args:
-        model_path (str): Path to the .pth model file
-        model_type (str): Type of model ('standard' or 'stateless_resnet')
-        use_spike (bool): Deprecated parameter, use model_type='stateless_resnet' instead
-        batch_size (int): Batch size for testing
-        allow_non_strict (bool): Whether to allow non-strict model loading
-        model_size (int): Size of ResNet model (18 or 34)
+    # print(f"Testing on {subset_size} samples ({proportion*100:.1f}% of test set)")
+    print(f"In test function, attack_type: {attack_type}, optimizer: {optimizer}")
     
-    Returns:
-        dict: Dictionary containing test results for different attack scenarios
-    """
-    # Handle backward compatibility: if use_spike is True, override model_type
-    if use_spike:
-        model_type = 'stateless_resnet'
+    # Check if model is spiking or non-spiking
+    is_spiking = hasattr(model, 'T') and model.T > 0
+    print(f"Model is {'spiking' if is_spiking else 'non-spiking'}")
     
-    # Load test dataset
-    transform = transforms.Compose([transforms.ToTensor()])
-    test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    # Debug: Print model parameters to check if they're loaded correctly
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model has {total_params} parameters")
     
-    # Use 10% of test dataset
-    test_size = int(0.1 * len(test_dataset))
-    test_indices = torch.randperm(len(test_dataset))[:test_size]
-    test_subset = Subset(test_dataset, test_indices)
-    test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False)
-
-    # Initialize model based on model_type
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Save sample images for debugging
+    debug_images = []
+    debug_outputs = []
+    debug_labels = []
     
-    # Create the model based on model_type and model_size
-    if model_type == 'stateless_resnet':
-        if model_size == 18:
-            model = get_stateless_resnet18(num_classes=10, T=4)
-            print(f"Using StatelessResNet18 model with T=4")
-        else:
-            model = get_stateless_resnet34(num_classes=10, T=4)
-            print(f"Using StatelessResNet34 model with T=4")
-    else:
-        if model_size == 18:
-            model = get_resnet18(num_classes=10)
-            print(f"Using standard ResNet18 model")
-        else:
-            model = get_resnet34(num_classes=10)
-            print(f"Using standard ResNet34 model")
-    
-    # Load the model weights
-    try:
-        if allow_non_strict:
-            print("Loading with strict=False to allow architecture mismatch")
-            model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
-        else:
-            model.load_state_dict(torch.load(model_path, map_location=device))
-    except RuntimeError as e:
-        print(f"Error loading model: {e}")
-        print("Attempting load with strict=False...")
-        model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
-        print("Model loaded with missing keys ignored")
-    
-    model.to(device)
-    
-    # Don't set model.eval() here since each attack type will manage evaluation/training mode
-
-    results = {}
-    criterion = nn.CrossEntropyLoss(reduction='sum')
-
-    for attack_name, attack_config in ATTACK_CONFIGS.items():
-        # Initialize metrics for current attack
-        total_loss = 0
-        correct = 0
-        total = 0
-        per_class_correct = torch.zeros(10, device=device)
-        per_class_total = torch.zeros(10, device=device)
-        all_preds = []
-        all_targets = []
-
-        # Set model to appropriate mode for each attack type
-        if attack_config['type'] == 'pgd':
-            # For PGD attack, we'll set the model to eval mode in the attack function
-            # but will make sure gradients are computed
-            model.eval()
-            # Enable gradients for model parameters during attack
-            for param in model.parameters():
-                param.requires_grad = True
-        else:
-            # For clean and Gaussian noise evaluation, no gradients are needed
-            model.eval()
-            for param in model.parameters():
-                param.requires_grad = False
-
-        for images, labels in test_loader:
+    with torch.no_grad():
+        for batch_idx, (images, labels) in enumerate(test_loader):
             images, labels = images.to(device), labels.to(device)
             
-            # Apply attack
-            if attack_config['type'] == 'gn':
-                images = add_gaussian_noise(images, **attack_config['params'])
-            elif attack_config['type'] == 'pgd':
-                # Pass model_type to the pgd_attack function
-                params = {k: v for k, v in attack_config['params'].items()}
-                images = pgd_attack(
-                    model=model, 
-                    images=images, 
-                    labels=labels, 
-                    eps=params.get('eps', 0.01),
-                    alpha=params.get('alpha', 0.001),
-                    iters=params.get('iters', 10),
-                    model_type=model_type
-                )
+            # Save original images for debugging (first batch only)
+            if batch_idx == 0 and len(debug_images) < 5:
+                debug_images.append(("original", images[:5].clone()))
+            
+            # Apply attack if specified
+            if attack_type != 'none':
+                try:
+                    # Enable gradients for input images
+                    images.requires_grad = True
+                    
+                    # Generate adversarial examples
+                    adv_images = generate_adversarial_examples(
+                        model=model,
+                        images=images,
+                        labels=labels,
+                        attack_type=attack_type,
+                        eps=eps
+                    )
+                    
+                    # Save adversarial images for debugging (first batch only)
+                    if batch_idx == 0 and len(debug_images) < 10:
+                        debug_images.append((f"{attack_type}_attack", adv_images[:5].clone()))
+                    
+                    # Disable gradients after attack
+                    images = adv_images.detach()
+                except Exception as e:
+                    print(f"Warning: Attack generation failed, using original images. Error: {e}")
+                    images = images.detach()
+            
+            # Forward pass
+            outputs = model(images)
+            
+            # Save outputs for debugging (first batch only)
+            if batch_idx == 0 and len(debug_outputs) < 5:
+                debug_outputs.append((attack_type, outputs[:5].clone()))
+                debug_labels.append(labels[:5].clone())
+            
+            # Handle spiking neuron outputs
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+            
+            # Average over time dimension if needed
+            if len(outputs.shape) > 2:
+                outputs = outputs.mean(dim=0)
+            
+            # Get predictions
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+            
+            # Update confusion matrix
+            for t, p in zip(labels, predicted):
+                conf_matrix[t.long(), p.long()] += 1
+            
+            # Calculate per-class accuracy
+            c = predicted.eq(labels)
+            for i in range(labels.size(0)):
+                label = labels[i]
+                class_correct[label] += c[i].item()
+                class_total[label] += 1
+    
+    # Print debug information
+    print("\nDEBUG INFORMATION:")
+    print("Sample predictions:")
+    for i, ((attack_name, outputs), labels) in enumerate(zip(debug_outputs, debug_labels)):
+        print(f"\nSample outputs for {attack_name}:")
+        for j in range(min(5, outputs.size(0))):
+            if len(outputs.shape) > 2:  # Handle spiking outputs
+                output = outputs[:, j].mean(dim=0)
+            else:
+                output = outputs[j]
+            
+            _, pred = output.max(0)
+            print(f"  Sample {j}: Label={labels[j].item()}, Predicted={pred.item()}")
+            print(f"  Logits: {output.cpu().numpy()}")
+    
+    # Calculate overall accuracy
+    accuracy = 100. * correct / total
+    
+    # Calculate per-class accuracy
+    class_accuracies = [100. * class_correct[i] / class_total[i] if class_total[i] > 0 else 0 for i in range(10)]
+    
+    # Print per-class accuracy
+    print("\nPer-class accuracy:")
+    for i in range(10):
+        print(f"  Class {i}: {class_accuracies[i]:.2f}%")
+    
+    # Convert confusion matrix to numpy and move to CPU
+    conf_matrix = conf_matrix.cpu().numpy()
+    
+    return accuracy, class_accuracies, conf_matrix
 
-            # For evaluation, we always want no_grad
-            with torch.no_grad():
-                # Evaluate batch
-                batch_loss, batch_correct, batch_class_correct, batch_class_total, predicted = \
-                    evaluate_batch(model, images, labels, criterion, device)
-                
-                total_loss += batch_loss
-                correct += batch_correct
-                total += labels.size(0)
-                per_class_correct += batch_class_correct
-                per_class_total += batch_class_total
-                
-                all_preds.extend(predicted.cpu().numpy())
-                all_targets.extend(labels.cpu().numpy())
-
-        # Calculate metrics
-        test_loss = total_loss / total
-        test_acc = 100. * correct / total
-        class_accuracies = 100. * per_class_correct / per_class_total
-        conf_matrix = confusion_matrix(all_targets, all_preds)
+def test_all_models(attack_types=['none', 'gn', 'pgd'], batch_size=256, device='cuda', eps=0.1, proportion=0.1):
+    """
+    Test all models in the weight directory with specified attack types
+    """
+    results = {}
+    
+    # Get all model files
+    model_files = [f for f in os.listdir('weight') if f.endswith('.pth')]
+    print(f"Found {len(model_files)} model files: {model_files}")
+    
+    for model_file in model_files:
+        print(f"\nTesting {model_file}...")
         
-        # Find most confused pairs
-        confused_pairs = [(i, j, conf_matrix[i, j]) 
-                         for i in range(10) for j in range(10) if i != j]
-        confused_pairs.sort(key=lambda x: x[2], reverse=True)
-
-        results[attack_name] = {
-            'test_loss': test_loss,
-            'test_acc': test_acc,
-            'class_accuracies': class_accuracies.cpu().tolist(),
-            'confusion_matrix': conf_matrix,
-            'confused_pairs': confused_pairs[:5],
-            'per_class_correct': per_class_correct.cpu().tolist(),
-            'per_class_total': per_class_total.cpu().tolist()
-        }
-
-    # Make sure model is in eval mode when returning
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad = False
+        # Extract model parameters from filename
+        params = model_file.replace('.pth', '').split('_')
+        
+        # Handle different filename formats
+        if len(params) >= 4:  # Updated to account for optimizer in filename
+            if params[0] == 'standard':
+                model_type = 'standard'  # Always use 'standard' for get_model function
+                use_spike = params[2] == 'True'  # Convert to boolean
+                model_size = 16  # Default size for WideResNet
+                optimizer = params[3] if len(params) >= 4 else 'adamw'  # Extract optimizer
+                print(f"Detected model parameters: model_type={model_type}, use_spike={use_spike}, model_size={model_size}, optimizer={optimizer}")
+            else:
+                print(f"Warning: Unexpected filename format for {model_file}, skipping...")
+                continue
+        else:
+            print(f"Warning: Unexpected filename format for {model_file}, skipping...")
+            continue
+        
+        # Create model with DEBUG output
+        try:
+            print(f"Creating model with params: model_type={model_type}, use_spike={use_spike}, model_size={model_size}")
+            model = get_model(
+                num_classes=10,
+                use_spike=use_spike,
+                T=4,  # Default timesteps for spiking models
+                model_type=model_type,
+                model_size=model_size
+            )
+            print(f"Model created successfully: {type(model).__name__}")
+        except Exception as e:
+            print(f"Error creating model: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+        
+        # Load weights
+        try:
+            state_dict = torch.load(os.path.join('weight', model_file))
+            print(f"State dict loaded with {len(state_dict)} keys")
+            
+            # Debug: print model state_dict keys vs loaded keys
+            model_keys = set(model.state_dict().keys())
+            loaded_keys = set(state_dict.keys())
+            
+            if model_keys != loaded_keys:
+                missing_in_model = loaded_keys - model_keys
+                missing_in_loaded = model_keys - loaded_keys
+                
+                if missing_in_model:
+                    print(f"Keys in loaded state_dict but not in model: {missing_in_model}")
+                if missing_in_loaded:
+                    print(f"Keys in model but not in loaded state_dict: {missing_in_loaded}")
+            
+            model.load_state_dict(state_dict)
+            model = model.to(device)
+            model.eval()
+            print(f"Weights loaded successfully")
+        except Exception as e:
+            print(f"Error loading weights: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+        
+        # Test with each attack type
+        model_results = {}
+        for attack in attack_types:
+            print(f"  Testing with {attack} attack...")
+            try:
+                acc, class_accs, conf_matrix = test(
+                    model=model,
+                    attack_type=attack,
+                    batch_size=batch_size,
+                    device=device,
+                    eps=eps,
+                    proportion=proportion,
+                    optimizer=optimizer.lower()  # Pass optimizer to test function
+                )
+                
+                model_results[attack] = {
+                    'accuracy': acc,
+                    'class_accuracies': class_accs,
+                    'confusion_matrix': conf_matrix
+                }
+                
+                print(f"    Accuracy: {acc:.2f}%")
+            except Exception as e:
+                print(f"    Error during testing: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        if model_results:  # Only add if we have results
+            results[model_file] = model_results
+    
+    print("\nFinal results structure:")
+    for model_name, model_results in results.items():
+        print(f"\n{model_name}:")
+        for attack_name, attack_results in model_results.items():
+            print(f"  {attack_name}: {attack_results['accuracy']:.2f}%")
     
     return results
 
-def test_models():
-    # Create random input data (MNIST shape)
-    batch_size = 2
-    x = torch.randn(batch_size, 1, 28, 28)
-    
-    # Test ResNet34
-    print("Testing ResNet34...")
-    resnet34_model = get_model(num_classes=10, model_type='standard')
-    resnet34_model.eval()
-    
-    with torch.no_grad():
-        resnet34_output = resnet34_model(x)
-        print(f"ResNet34 output shape: {resnet34_output.shape}")
-    
-    # Test StatelessResNet
-    print("\nTesting StatelessResNet...")
-    resnet_model = get_model(num_classes=10, model_type='stateless_resnet', T=4)
-    resnet_model.eval()
-    
-    with torch.no_grad():
-        resnet_output = resnet_model(x)
-        print(f"StatelessResNet output shape: {resnet_output.shape}")
-    
-    print("\nBoth models successfully imported and tested!")
-
 if __name__ == "__main__":
-    weight_dir = "./weight"
-    for model_file in os.listdir(weight_dir):
-        if model_file.endswith(".pth"):
-            print(f"\nTesting model: {model_file}")
-            
-            # Determine model type from filename
-            model_type = 'stateless_resnet' if 'stateless_resnet' in model_file else 'standard'
-            
-            results = test(
-                model_path=os.path.join(weight_dir, model_file),
-                model_type=model_type
-            )
-            
-            for attack_name, attack_results in results.items():
-                print(f"\nAttack scenario: {attack_name}")
-                print(f"Test Accuracy: {attack_results['test_acc']:.2f}%")
-                print("Per-class accuracies:")
-                for i, acc in enumerate(attack_results['class_accuracies']):
-                    print(f"Digit {i}: {acc:.2f}%")
-                print("\nTop 5 most confused pairs (true_label, predicted_label, count):")
-                for pair in attack_results['confused_pairs']:
-                    print(f"  {pair[0]} → {pair[1]}: {pair[2]}")
-
-    test_models()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Test SNN models on MNIST.')
+    parser.add_argument('--model_path', type=str, default=None, help='Path to model weights')
+    parser.add_argument('--use_spike', action='store_true', help='Use spiking neurons')
+    parser.add_argument('--attack_type', type=str, default='none', choices=['none', 'gn', 'pgd'],
+                      help='Attack type')
+    parser.add_argument('--model_type', type=str, default='standard', choices=['standard'],
+                      help='Type of model to use')
+    parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
+    parser.add_argument('--time_steps', type=int, default=4, help='Number of time steps for spiking networks')
+    parser.add_argument('--eps', type=float, default=0.1, help='Epsilon for adversarial attack')
+    parser.add_argument('--proportion', type=float, default=0.1, help='Proportion of test set to use (0-1)')
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['sgd', 'adam', 'adamw'],
+                      help='Optimizer used for training')
+    args = parser.parse_args()
+    
+    # Test the test function directly
+    print("Testing the test function directly...")
+    
+    # Create a model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = get_model(
+        num_classes=10,
+        use_spike=args.use_spike,
+        T=args.time_steps,
+        model_type=args.model_type
+    )
+    
+    # If model path is provided, load weights
+    if args.model_path:
+        print(f"Loading model from {args.model_path}")
+        model.load_state_dict(torch.load(args.model_path, map_location=device))
+    else:
+        print("Using model with random weights (no model path provided)")
+    
+    model = model.to(device)
+    model.eval()
+    
+    # Run the test function
+    print(f"Running test with attack_type={args.attack_type}, optimizer={args.optimizer}")
+    acc, per_class_acc, conf_matrix = test(
+        model=model,
+        attack_type=args.attack_type,
+        batch_size=args.batch_size,
+        device=device,
+        eps=args.eps,
+        proportion=args.proportion,
+        optimizer=args.optimizer.lower()
+    )
+    
+    print(f"\nTest Results:")
+    print(f"Overall accuracy: {acc:.2f}%")
+    print("\nPer-class accuracy summary:")
+    for i, class_acc in enumerate(per_class_acc):
+        print(f"  Class {i}: {class_acc:.2f}%")

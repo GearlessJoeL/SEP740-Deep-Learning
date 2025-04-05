@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class TensorNormalization(nn.Module):
-    def __init__(self,mean, std):
+    def __init__(self, mean, std):
         super(TensorNormalization, self).__init__()
         if not isinstance(mean, torch.Tensor):
             mean = torch.tensor(mean)
@@ -11,12 +11,18 @@ class TensorNormalization(nn.Module):
             std = torch.tensor(std)
         self.mean = mean
         self.std = std
-    def forward(self,X):
-        return normalizex(X,self.mean,self.std)
+    def forward(self, X):
+        return normalizex(X, self.mean, self.std)
     def extra_repr(self) -> str:
         return 'mean=%s, std=%s'%(self.mean, self.std)
 
 def normalizex(tensor, mean, std):
+    # Handle scalar mean and std by converting to proper shape
+    if mean.ndim == 0:
+        mean = mean.reshape(1)
+    if std.ndim == 0:
+        std = std.reshape(1)
+        
     mean = mean[None, :, None, None]
     std = std[None, :, None, None]
     if mean.device != tensor.device:
@@ -83,53 +89,56 @@ class RateBp(torch.autograd.Function):
         return grad_input
 
 class LIFSpike(nn.Module):
-    def __init__(self, T=8, thresh=1.0, tau=0.5, inhibition=False):
-        super(LIFSpike, self).__init__()
-        self.thresh = thresh
-        self.tau = tau
+    def __init__(self, T, thresh=1.0, tau=0.5, surrogate='sigmoid', alpha=4.0):
+        super().__init__()
         self.T = T
-        self.inhibition = inhibition
-        self.reset_mem()
+        self.thresh = thresh
+        self.tau = tau  # 膜电位衰减系数
+        self.alpha = alpha  # 替代梯度陡峭度
         
-    def reset_mem(self):
-        self.mem = None
-        self.spike = None
+        # 选择替代梯度函数
+        if surrogate == 'sigmoid':
+            self.surrogate = lambda x: torch.sigmoid(alpha * x)
+        else:  # 默认使用矩形窗
+            self.surrogate = lambda x: (x.abs() < 0.5).float()
         
-    def forward(self, input):
-        # Initialize membrane potential if not already done
-        if self.mem is None:
-            self.mem = torch.zeros_like(input)
-        if self.spike is None:
-            self.spike = torch.zeros_like(input)
+        self.expand = ExpandTemporalDim(T)
+        self.merge = MergeTemporalDim(T)
+
+    def forward(self, x):
+        if self.T == 0:  # 非脉冲模式
+            return F.relu(x)
+            
+        # 展开时间维度 [B*T, ...] -> [T, B, ...]
+        x = self.expand(x)
+        batch_size = x.shape[1]
+        device = x.device
         
-        # Create new tensors instead of modifying in-place
-        mem = self.mem.clone()
-        spike = self.spike.clone()
+        # 初始化膜电位和脉冲序列
+        mem = torch.zeros(batch_size, *x.shape[2:], device=device)
+        spikes = []
         
-        # Leaky integrate-and-fire
-        mem = mem * self.tau + input * (1 - self.tau)
+        for t in range(self.T):
+            # 更新膜电位 (带梯度)
+            mem = mem * self.tau + x[t]
+            
+            # 生成脉冲（前向：硬阈值，反向：替代梯度）
+            spike = (mem > self.thresh).float()
+            if self.training or mem.requires_grad:
+                spike = spike + (self.surrogate(mem - self.thresh) - self.surrogate(mem - self.thresh).detach())
+            
+            # 软重置（保留梯度）
+            mem = mem - spike * self.thresh
+            
+            spikes.append(spike)
         
-        # Spiking mechanism
-        spike = (mem >= self.thresh).float()
-        
-        # Reset membrane potential after spike (without in-place operation)
-        mem = mem * (1 - spike)
-        
-        # Store updated values (without in-place operations)
-        self.mem = mem.detach()  # Detach to avoid gradient tracking
-        self.spike = spike.detach()  # Detach to avoid gradient tracking
-        
-        return spike
+        # 合并时间维度 [T, B, ...] -> [B*T, ...]
+        return self.merge(torch.stack(spikes, dim=0))
+
 
 def add_dimention(x, T):
-    # Ensure x is the right shape before adding time dimension
-    if len(x.shape) == 4:  # [batch, channels, height, width]
-        # Reshape to [T, batch, channels, height, width]
-        x = x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
-    else:
-        print(f"Warning: Unexpected input shape in add_dimention: {x.shape}")
-        x = x.unsqueeze(1)
-        x = x.repeat(T, 1, 1, 1, 1)
+    x.unsqueeze_(1)
+    x = x.repeat(T, 1, 1, 1, 1)
     return x
 
 class ConvexCombination(nn.Module):

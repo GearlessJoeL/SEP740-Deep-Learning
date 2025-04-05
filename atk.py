@@ -2,102 +2,50 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def add_gaussian_noise(images, std=0.0001):
-    """Add Gaussian noise to images.
-    
-    Args:
-        images (torch.Tensor): Input images
-        std (float): Standard deviation of the Gaussian noise
-    
-    Returns:
-        torch.Tensor: Noisy images
-    """
+def add_gaussian_noise(images, std=0.1):
+    """Add Gaussian noise to images"""
     noise = torch.randn_like(images) * std
-    return images + noise
+    return torch.clamp(images + noise, 0, 1)
 
-def pgd_attack(model, images, labels, eps=0.01, alpha=0.001, iters=10, model_type='standard'):
-    """
-    Perform a Projected Gradient Descent (PGD) attack on the model.
+def pgd_attack(model, images, labels, eps=0.3, alpha=0.01, iters=10):
+    """Improved PGD attack implementation"""
+    # Save original model state
+    was_training = model.training
+    model.eval()  # Set to eval mode but enable gradients
     
-    Args:
-        model: The model to attack
-        images: The input images
-        labels: The target labels
-        eps: Maximum perturbation size (epsilon)
-        alpha: Step size for gradient update
-        iters: Number of attack iterations
-        model_type: Type of model ('standard' or 'stateless_resnet')
+    # Initialize adversarial examples
+    orig_images = images.clone().detach()
+    adv_images = orig_images + torch.empty_like(orig_images).uniform_(-eps, eps)
+    adv_images = torch.clamp(adv_images, 0, 1).requires_grad_(True)
     
-    Returns:
-        Adversarial images
-    """
-    # If it's a spiking model, use a simplified attack
-    if model_type == 'stateless_resnet' or hasattr(model, 'T'):
-        return spiking_pgd_attack(model, images, labels, eps, alpha, iters)
-    
-    # Store original model state
-    training = model.training
-    
-    # Set model to evaluation mode, but make sure requires_grad is enabled for relevant parameters
-    model.eval()
-    
-    # Ensure model parameters have requires_grad enabled during the attack
-    for param in model.parameters():
-        param.requires_grad = True
-    
-    # Clone the images to avoid modifying the original data
-    images = images.clone().detach()
-    adv_images = images.clone().detach()
-    
-    # PGD attack iterations
-    for i in range(iters):
-        try:
-            # Setup for gradient calculation
-            adv_images = adv_images.detach().requires_grad_(True)
-            
+    for _ in range(iters):
+        with torch.enable_grad():
             # Forward pass
             outputs = model(adv_images)
             
-            # Handle spiking model output format
-            if len(outputs.shape) == 3:  # Shape: [time_steps, batch_size, num_classes]
-                outputs = outputs.mean(dim=0)  # Average over time dimension
+            # Handle spiking neuron output format
+            if len(outputs.shape) == 3:
+                outputs = outputs.mean(dim=0)
             
-            # Calculate loss (maximizing the original class loss)
-            model.zero_grad()
+            # Calculate loss (we want to maximize this loss)
             loss = F.cross_entropy(outputs, labels)
-            
-            # Make sure loss requires grad
-            if not loss.requires_grad:
-                print(f"Warning: loss doesn't require grad in iteration {i}")
-                continue
-                
-            # Calculate gradients
-            loss.backward()
-            
-            # Get gradients from adv_images
-            if adv_images.grad is None:
-                print(f"Warning: gradients are None in iteration {i}")
-                continue
-                
-            # Update adversarial images
-            with torch.no_grad():
-                # Use FGSM update rule
-                adv_images = adv_images.detach() + alpha * adv_images.grad.sign()
-                
-                # Project back to epsilon ball and valid image range
-                delta = torch.clamp(adv_images - images, -eps, eps)
-                adv_images = torch.clamp(images + delta, 0, 1)
-                
-        except Exception as e:
-            print(f"Error in PGD attack iteration {i}: {e}")
+        
+        # Calculate gradient
+        grad = torch.autograd.grad(loss, adv_images, only_inputs=True)[0]
+        
+        # Update adversarial examples (maximize loss by following gradient)
+        adv_images = adv_images.detach() + alpha * grad.sign()
+        
+        # Project back to epsilon ball and valid image range
+        delta = torch.clamp(adv_images - orig_images, -eps, eps)
+        adv_images = torch.clamp(orig_images + delta, 0, 1).requires_grad_(True)
     
     # Restore original model state
-    if not training:
+    if was_training:
+        model.train()
+    else:
         model.eval()
-        # Reset requires_grad to False for evaluation
-        for param in model.parameters():
-            param.requires_grad = False
-        
+    
     return adv_images.detach()
 
 def spiking_pgd_attack(model, images, labels, eps=0.01, alpha=0.001, iters=10):
@@ -194,47 +142,37 @@ def spiking_pgd_attack(model, images, labels, eps=0.01, alpha=0.001, iters=10):
     
     return best_adv.detach()
 
-def generate_adversarial_examples(model, images, labels, attack_type='none', model_type='standard'):
+def generate_adversarial_examples(model, images, labels, attack_type, eps=0.1):
     """
-    Generate adversarial examples for training or testing.
+    Generate adversarial examples using specified attack type
     
     Args:
         model: The model to attack
-        images: The input images
-        labels: The target labels
-        attack_type: Type of attack ('none', 'gn', or 'pgd')
-        model_type: Type of model ('standard' or 'stateless_resnet')
-    
-    Returns:
-        Adversarial images
+        images: Input images
+        labels: Target labels
+        attack_type: Type of attack ('gn' or 'pgd')
+        eps: Maximum perturbation size
     """
-    if attack_type == 'none':
-        return images
-    elif attack_type == 'gn':
-        return add_gaussian_noise(images, **ATTACK_CONFIGS['gaussian_medium']['params'])
+    if attack_type == 'gn':
+        # Gaussian noise attack
+        return add_gaussian_noise(images, eps)
+    
     elif attack_type == 'pgd':
-        # Extract parameters from attack config
-        params = ATTACK_CONFIGS['pgd_medium']['params']
-        # Call pgd_attack with explicit named parameters
+        # Use PGD attack
         return pgd_attack(
-            model=model, 
-            images=images, 
-            labels=labels, 
-            eps=params.get('eps', 0.01),
-            alpha=params.get('alpha', 0.001),
-            iters=params.get('iters', 10),
-            model_type=model_type
+            model=model,
+            images=images,
+            labels=labels,
+            eps=eps,
+            alpha=eps/4,  # Step size
+            iters=10      # Number of iterations
         )
+    
     else:
         raise ValueError(f"Unknown attack type: {attack_type}")
 
-# Define standard attack configurations
+# Attack configurations
 ATTACK_CONFIGS = {
-    'clean': {'type': 'none', 'params': {}},
-    'gaussian_weak': {'type': 'gn', 'params': {'std': 0.0001}},
-    'gaussian_medium': {'type': 'gn', 'params': {'std': 0.001}},
-    'gaussian_strong': {'type': 'gn', 'params': {'std': 0.01}},
-    'pgd_weak': {'type': 'pgd', 'params': {'eps': 0.0001, 'alpha': 0.00001, 'iters': 10}},
-    'pgd_medium': {'type': 'pgd', 'params': {'eps': 0.001, 'alpha': 0.0001, 'iters': 10}},
-    'pgd_strong': {'type': 'pgd', 'params': {'eps': 0.01, 'alpha': 0.001, 'iters': 10}}
+    'gn': {'eps': 0.1},
+    'pgd': {'eps': 0.1, 'alpha': 0.01, 'iters': 10}
 }
