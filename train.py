@@ -91,19 +91,33 @@ def train(use_spike=False, atk='none', epochs=50, batch_size=64, lr=0.001, model
         for i, (images, labels) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device)
             
-            # Apply attack if specified
+            # Apply attack if specified (to 70% of the batch)
             if atk != 'none':
                 try:
-                    # 保留原始图像梯度
-                    images.requires_grad_(True)
-                    adv_images = generate_adversarial_examples(
-                        model=model,
-                        images=images,
-                        labels=labels,
-                        attack_type=atk,
-                        eps=0.0001
-                    )
-                    images = adv_images.detach()  # 必须detach以防止梯度重复计算
+                    # Determine batch size and how many images to attack (70%)
+                    batch_size = images.size(0)
+                    attack_size = int(batch_size * 0.7)
+                    
+                    if attack_size > 0:
+                        # Randomly select which images to attack
+                        indices = torch.randperm(batch_size, device=device)
+                        attack_indices = indices[:attack_size]
+                        
+                        # Create copies of the images to be attacked
+                        images_to_attack = images[attack_indices].clone()
+                        images_to_attack.requires_grad_(True)
+                        
+                        # Generate adversarial examples
+                        adv_images = generate_adversarial_examples(
+                            model=model,
+                            images=images_to_attack,
+                            labels=labels[attack_indices],
+                            attack_type=atk,
+                            eps=0.0001
+                        )
+                        
+                        # Replace only the selected images with their adversarial versions
+                        images[attack_indices] = adv_images.detach()
                 except Exception as e:
                     print(f"Attack failed: {e}")
                     # Continue with original images if attack fails
@@ -159,7 +173,6 @@ def train(use_spike=False, atk='none', epochs=50, batch_size=64, lr=0.001, model
                             labels=labels,
                             attack_type=atk,
                             eps=0.0001
-                            # model_type=model_type
                         )
                         images = adv_images.detach() 
                     except Exception as e:
