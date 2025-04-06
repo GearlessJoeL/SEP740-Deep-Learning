@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision import datasets, transforms
 from model import get_model
 import argparse
@@ -11,10 +11,33 @@ from atk import generate_adversarial_examples
 # Ensure weights directory exists
 os.makedirs('./weight', exist_ok=True)
 
-def train(use_spike=False, atk='none', epochs=50, batch_size=64, lr=0.001, model_type='standard', T=4, optimizer_type='adamw'):
+class MixedDataset(Dataset):
+    """Dataset that mixes raw and normalized images based on a proportion"""
+    def __init__(self, dataset, raw_proportion=0.0):
+        self.dataset = dataset
+        self.raw_proportion = raw_proportion
+        self.normalize = transforms.Normalize((0.1307,), (0.3081,))
+        
+    def __len__(self):
+        return len(self.dataset)
+        
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+        
+        # If random number is less than raw_proportion, return raw image
+        if torch.rand(1).item() < self.raw_proportion:
+            # Skip normalization for this image
+            return image, label
+        else:
+            # Apply normalization
+            return self.normalize(image), label
+
+def train(use_spike=False, atk='none', epochs=50, batch_size=64, lr=0.001, 
+          model_type='standard', T=4, optimizer_type='adamw', raw_prop=0.0):
     """
     Train the model using the original procedure with just 10% of the data and adversarial attacks
     Now supporting different optimizers: SGD, Adam, and AdamW
+    raw_prop: proportion of raw (unnormalized) images to use in training (0.0 to 1.0)
     """
     # Set random seed for reproducibility
     torch.manual_seed(42)
@@ -24,7 +47,7 @@ def train(use_spike=False, atk='none', epochs=50, batch_size=64, lr=0.001, model
     # Load MNIST dataset
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
+        # Normalization will be applied selectively in the MixedDataset
     ])
     
     train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
@@ -37,14 +60,18 @@ def train(use_spike=False, atk='none', epochs=50, batch_size=64, lr=0.001, model
     test_indices = torch.randperm(len(test_dataset))[:test_size]
     train_subset = Subset(train_dataset, train_indices)
     test_subset = Subset(test_dataset, test_indices)
+    
+    # Wrap datasets with MixedDataset to control raw image proportion
+    train_mixed = MixedDataset(train_subset, raw_prop)
+    test_mixed = MixedDataset(test_subset, raw_prop)
 
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, 
+    train_loader = DataLoader(train_mixed, batch_size=batch_size, shuffle=True, 
                              num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False,
+    test_loader = DataLoader(test_mixed, batch_size=batch_size, shuffle=False,
                             num_workers=4, pin_memory=True)
 
     print(f"Training on {train_size} samples, testing on {test_size} samples")
-    print(f"Attack type: {atk}, Optimizer: {optimizer_type}")
+    print(f"Attack type: {atk}, Optimizer: {optimizer_type}, Raw image proportion: {raw_prop}")
 
     # Initialize model
     model = get_model(
@@ -197,7 +224,7 @@ def train(use_spike=False, atk='none', epochs=50, batch_size=64, lr=0.001, model
         # Save best model
         if test_acc > best_acc:
             best_acc = test_acc
-            model_name = f"{model_type}_spike_{use_spike}_atk_{atk}_{optimizer_type}.pth"
+            model_name = f"{model_type}_spike_{use_spike}_atk_{atk}_{optimizer_type}_raw_prop_{raw_prop:.2f}.pth"
             torch.save(model.state_dict(), f"./weight/{model_name}")
             print(f'New best model saved with accuracy: {best_acc:.2f}%')
         
@@ -211,7 +238,8 @@ def train(use_spike=False, atk='none', epochs=50, batch_size=64, lr=0.001, model
         'best_acc': best_acc,
         'train_losses': train_losses,
         'train_accuracies': train_accuracies,
-        'test_accuracies': test_accuracies
+        'test_accuracies': test_accuracies,
+        'raw_prop': raw_prop
     }
 
 if __name__ == "__main__":
@@ -227,18 +255,47 @@ if __name__ == "__main__":
     parser.add_argument('--time_steps', type=int, default=4, help='Number of time steps for spiking networks')
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['sgd', 'adam', 'adamw'],
                        help='Optimizer to use for training')
+    parser.add_argument('--raw_prop', type=float, default=None, 
+                       help='Proportion of raw images to use (0.0-1.0). If not specified, will train with all proportions [0, 0.25, 0.5, 0.75]')
     
     args = parser.parse_args()
     
-    train_history = train(
-        use_spike=args.use_spike,
-        atk=args.attack,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        model_type=args.model_type,
-        T=args.time_steps,
-        optimizer_type=args.optimizer
-    )
-    
-    print(f"Training completed. Best test accuracy: {train_history['best_acc']:.2f}%")
+    # If raw_prop is provided, train with just that proportion
+    if args.raw_prop is not None:
+        train_history = train(
+            use_spike=args.use_spike,
+            atk=args.attack,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            model_type=args.model_type,
+            T=args.time_steps,
+            optimizer_type=args.optimizer,
+            raw_prop=args.raw_prop
+        )
+        print(f"Training completed with raw_prop={args.raw_prop}. Best test accuracy: {train_history['best_acc']:.2f}%")
+    else:
+        # Train with different proportions as specified
+        proportions = [0.0, 0.25, 0.5, 0.75]
+        results = []
+        
+        for prop in proportions:
+            print(f"\n\n========== Training with raw image proportion: {prop} ==========\n")
+            train_history = train(
+                use_spike=args.use_spike,
+                atk=args.attack,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                lr=args.lr,
+                model_type=args.model_type,
+                T=args.time_steps,
+                optimizer_type=args.optimizer,
+                raw_prop=prop
+            )
+            results.append(train_history)
+            print(f"Training completed with raw_prop={prop}. Best test accuracy: {train_history['best_acc']:.2f}%")
+        
+        # Print summary of results
+        print("\n\n========== Summary of Results ==========")
+        for idx, res in enumerate(results):
+            print(f"Raw Proportion {proportions[idx]:.2f}: Test Accuracy {res['best_acc']:.2f}%")
